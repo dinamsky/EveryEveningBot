@@ -1,1 +1,1 @@
-from api.stage3 import handler
+from api.content import handler
