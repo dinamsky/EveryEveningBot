@@ -1,1 +1,1 @@
-{"functions":{"api/index.py":{"runtime":"python3.12"}},"crons":[{"path":"/api/index?cron=1","schedule":"* * * * *"}]}
+{"crons":[{"path":"/api/index?cron=1","schedule":"* * * * *"}]}
