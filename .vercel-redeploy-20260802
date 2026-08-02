@@ -1,0 +1,1 @@
+Trigger fresh deployment from current main branch after fixing vercel.json runtime configuration.
