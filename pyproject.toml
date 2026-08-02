@@ -1,9 +1,9 @@
 [project]
 name = "every-evening-bot"
-version = "0.1.1"
+version = "0.1.0"
 description = "Telegram bot for daily AA step work"
 requires-python = ">=3.12"
 dependencies = []
 
 [tool.vercel]
-entrypoint = "api.stage4:handler"
+entrypoint = "api.stage3:handler"
