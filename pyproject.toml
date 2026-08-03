@@ -6,4 +6,4 @@ requires-python = ">=3.12"
 dependencies = []
 
 [tool.vercel]
-entrypoint = "api.stage3:handler"
+entrypoint = "api.stage4_fixed:handler"
