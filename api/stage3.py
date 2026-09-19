@@ -1,5 +1,8 @@
 from http.server import BaseHTTPRequestHandler
-import os,json,urllib.request,urllib.parse,html,secrets
+import os,json,urllib.request,urllib.parse,urllib.error,html,secrets,sys
+from eveningbot import features
+from eveningbot.messages import message_parts
+from eveningbot.webhook import WebhookHandler
 from datetime import datetime,date,timezone,timedelta
 from zoneinfo import ZoneInfo
 
@@ -18,13 +21,24 @@ def request(url,data=None,headers=None):
  b=None if data is None else json.dumps(data).encode(); r=urllib.request.Request(url,data=b,headers=headers or {'Content-Type':'application/json'})
  with urllib.request.urlopen(r,timeout=20) as x:return json.loads(x.read().decode())
 def tg(m,p):return request(f'https://api.telegram.org/bot{TOKEN}/{m}',p)
-def send(cid,text,k=None):
- p={'chat_id':cid,'text':text,'parse_mode':'HTML'}
- if k:p['reply_markup']=k
- return tg('sendMessage',p)
+def send(cid, text, k=None):
+ parts = message_parts(text)
+ result = None
+ for index, part in enumerate(parts):
+  payload = {'chat_id': cid, **part}
+  if k and index == len(parts) - 1:
+   payload['reply_markup'] = k
+  result = tg('sendMessage', payload)
+ return result
+
 def rc(*parts):
- u=RURL+'/'+ '/'.join(urllib.parse.quote(str(x),safe='') for x in parts)
- return request(u,headers={'Authorization':'Bearer '+RTOK}).get('result')
+ if not RURL or not RTOK:
+  raise RuntimeError('Redis is not configured')
+ result = request(RURL, list(parts), {'Authorization': 'Bearer ' + RTOK, 'Content-Type': 'application/json'})
+ if 'error' in result:
+  raise RuntimeError('Redis command failed')
+ return result.get('result')
+
 def gj(k,d=None):
  v=rc('GET',k);return d if v is None else json.loads(v)
 def sj(k,v,ttl=None):
@@ -41,11 +55,18 @@ def ensure(fr,sponsor=None):
 
 def menu(uid):
  rows=[[{'text':'🌅 Утренний 11 шаг'},{'text':'🌙 Вечерний 11 шаг'}],[{'text':'✍️ Текущий 10 шаг'},{'text':'📖 Чтение дня'}],[{'text':'🎂 Моя трезвость'},{'text':'📋 Задания'}],[{'text':'🆘 Мне тяжело'}],[{'text':'⏰ Напоминание'},{'text':'🕰 Часовой пояс'}]]
+ rows.insert(2, [{'text': '🙏 Молитвы'}, {'text': '📘 Большая книга'}])
+ rows.append([{'text': '📚 Мои ответы'}, {'text': '▶️ Продолжить'}])
  if uid==OWNER:rows += [[{'text':'🛠 Админка'}],[{'text':'👥 Подопечные'},{'text':'📊 Сегодня'}],[{'text':'📩 Последние отчёты'},{'text':'📣 Напомнить'}]]
  return {'keyboard':rows,'resize_keyboard':True}
 def ik(rows):return {'inline_keyboard':rows}
 
 def start_flow(uid,mode,questions,title):
+ current = gj(skey(uid))
+ if current:
+  if current.get('mode') == mode:
+   return features.resume(sys.modules[__name__], uid)
+  return send(uid, 'Есть незаконченный диалог. /resume — продолжить опрос; /cancel — отменить его перед новым.')
  sj(skey(uid),{'mode':mode,'i':0,'answers':[]},86400);send(uid,f'<b>{title}</b>');ask(uid,questions,0)
 def ask(uid,qs,i):send(uid,f'<b>Вопрос {i+1} из {len(qs)}</b>\n\n{html.escape(qs[i])}',ik([[{'text':'Отменить','callback_data':'cancel'}]]))
 def qset(mode):return MORNING if mode=='morning' else TENTH if mode=='tenth' else EVENING
@@ -68,10 +89,23 @@ def finish(uid,s):
 def sobriety(uid):
  u=gj(ukey(uid),{}) or {}; sd=u.get('sobriety_date')
  if not sd:
-  sj(skey(uid),{'mode':'sobriety_date'},3600);return send(uid,'Введи дату трезвости в формате <code>ДД.ММ.ГГГГ</code>.')
- try:d=date.fromisoformat(sd);days=(date.today()-d).days
+  sj(skey(uid)+':settings',{'mode':'sobriety_date'},3600);return send(uid,'Введи дату трезвости в формате <code>ДД.ММ.ГГГГ</code>.')
+ try:d=date.fromisoformat(sd);days=(now(u).date()-d).days
  except:return send(uid,'Дата трезвости сохранена неверно. Отправь /sobriety_reset.')
  send(uid,f'🎂 <b>Трезвость</b>\n\nДата: <b>{d.strftime("%d.%m.%Y")}</b>\nСегодня: <b>{days} дней</b>.')
+
+def set_sobriety_date(uid, value, state_key=None):
+ user = gj(ukey(uid), {}) or {}
+ try:
+  parsed = datetime.strptime(value, '%d.%m.%Y').date()
+  if parsed > now(user).date():
+   raise ValueError('future date')
+ except ValueError:
+  return send(uid, 'Нужна дата не позднее сегодняшнего дня: <code>ДД.ММ.ГГГГ</code>.')
+ user['sobriety_date'] = parsed.isoformat()
+ sj(ukey(uid), user)
+ rc('DEL', state_key or skey(uid))
+ return sobriety(uid)
 
 def tasks(uid):
  arr=gj(f'tasks:{uid}',[]) or []
@@ -90,29 +124,47 @@ def sponsees():
  return out
 
 def stats(uid):
- ds=[]
- for i in range(30):
-  d=(date.today()-timedelta(days=i)).isoformat()
-  if gj(f'done:evening:{d}:{uid}'):ds.append(d)
- streak=0
- for i in range(365):
-  d=(date.today()-timedelta(days=i)).isoformat()
-  if gj(f'done:evening:{d}:{uid}'):streak+=1
-  else:break
- return len([d for d in ds if d>= (date.today()-timedelta(days=6)).isoformat()]),len(ds),streak
+ user = gj(ukey(uid), {}) or {}
+ today = now(user).date()
+ dates = [(today - timedelta(days=i)).isoformat() for i in range(180)]
+ keys = [f'done:evening:{day}:{uid}' for day in dates] + [f'done:{day}:{uid}' for day in dates]
+ values = rc('MGET', *keys) or [None] * len(keys)
+ flags = [bool(values[i] or values[180 + i]) for i in range(180)]
+ streak = 0
+ for done in flags[0 if flags[0] else 1:]:
+  if not done:
+   break
+  streak += 1
+ return sum(flags[:7]), sum(flags[:30]), streak
+
+
+def completed_today(user):
+ day = now(user).date().isoformat()
+ return bool(gj(f'done:evening:{day}:{user["id"]}') or gj(f'done:{day}:{user["id"]}'))
 
 def admin(uid):
- us=sponsees();today=date.today().isoformat();answered=sum(1 for u in us if gj(f'done:evening:{today}:{u["id"]}'))
+ us=sponsees();answered=sum(1 for u in us if completed_today(u))
  send(uid,f'<b>🛠 Панель спонсора</b>\n\n👥 Подопечных: <b>{len(us)}</b>\n✅ Ответили сегодня: <b>{answered}</b>\n🕓 Не ответили: <b>{len(us)-answered}</b>',ik([[{'text':'👥 Подопечные','callback_data':'a:users'}],[{'text':'📊 Сегодня','callback_data':'a:today'}],[{'text':'📩 Последние отчёты','callback_data':'a:last'}],[{'text':'📣 Напомнить неответившим','callback_data':'a:remind'}]]))
 def admin_users(uid):
  lines=['<b>👥 Подопечные</b>','']
  for u in sponsees():
   w,m,st=stats(u['id']);lines.append(f"• <b>{html.escape(u.get('name',''))}</b> — 7 дней: {w}/7, 30 дней: {m}/30, серия: {st}")
- send(uid,'\n'.join(lines) if len(lines)>2 else 'Подопечных пока нет.')
+ rows = [[{'text': u.get('name', str(u['id']))[:50], 'callback_data': f'card:{u["id"]}'}]
+         for u in sponsees() if features.can_read(sys.modules[__name__], uid, u['id'])]
+ send(uid,'\n'.join(lines) if len(lines)>2 else 'Подопечных пока нет.', ik(rows) if rows else None)
+def sponsee_card(viewer, subject):
+ if not features.can_read(sys.modules[__name__], viewer, subject) or viewer != OWNER:
+  return send(viewer, 'Нет доступа. Используй персональное приглашение для подключения подопечного.')
+ user = gj(ukey(subject), {}) or {}
+ return send(viewer, '<b>👤 ' + html.escape(user.get('name', str(subject))) + '</b>\n\n'
+             + 'Часовой пояс: ' + html.escape(user.get('timezone', TZ)), ik([
+   [{'text': '📚 История ответов', 'callback_data': f'h:page:{subject}:0'}],
+   [{'text': '💬 Написать', 'url': f'tg://user?id={subject}'}]]))
+
 def admin_today(uid):
  d=date.today().isoformat();a=[];m=[]
- for u in sponsees():(a if gj(f'done:evening:{d}:{u["id"]}') else m).append(u)
- send(uid,'<b>📊 Сегодня</b>\n\n✅ Ответили:\n'+('\n'.join('• '+html.escape(x['name']) for x in a) or '—')+'\n\n🕓 Не ответили:\n'+('\n'.join('• '+html.escape(x['name']) for x in m) or '—'))
+ for u in sponsees():(a if completed_today(u) else m).append(u)
+ send(uid,'<b>📊 Сегодня</b>\nПо местному дню каждого участника.\n\n✅ Ответили:\n'+('\n'.join('• '+html.escape(x['name']) for x in a) or '—')+'\n\n🕓 Не ответили:\n'+('\n'.join('• '+html.escape(x['name']) for x in m) or '—'))
 def admin_last(uid):
  raw=rc('LRANGE','entries:latest',0,9) or [];lines=['<b>📩 Последние записи</b>','']
  for x in raw:
@@ -121,26 +173,31 @@ def admin_last(uid):
 def remind(uid):
  d=date.today().isoformat();n=0
  for u in sponsees():
-  if not gj(f'done:evening:{d}:{u["id"]}'):
+  if not completed_today(u):
    try:send(u['id'],'🌙 Напоминание от спонсора: пора пройти вечернюю часть.',ik([[{'text':'Начать','callback_data':'flow:evening'}]]));n+=1
    except:pass
  send(uid,f'Напоминание отправлено: <b>{n}</b>.')
 
 def handle_text(m):
- uid=m['from']['id'];t=m.get('text','').strip();ensure(m['from']);s=gj(skey(uid))
- if s and s.get('mode') in ('morning','evening','tenth') and not t.startswith('/'):
-  s['answers'].append(t);s['i']+=1;qs=qset(s['mode'])
-  if s['i']>=len(qs):return finish(uid,s)
-  sj(skey(uid),s,86400);return ask(uid,qs,s['i'])
- if s and s.get('mode')=='sobriety_date':
-  try:d=datetime.strptime(t,'%d.%m.%Y').date();u=gj(ukey(uid),{}) or {};u['sobriety_date']=d.isoformat();sj(ukey(uid),u);rc('DEL',skey(uid));return sobriety(uid)
-  except:return send(uid,'Формат даты: <code>ДД.ММ.ГГГГ</code>.')
- if s and s.get('mode')=='task_add':
-  arr=gj(f'tasks:{uid}',[]) or [];arr.append({'text':t,'done':False});sj(f'tasks:{uid}',arr);rc('DEL',skey(uid));return tasks(uid)
- if t.startswith('/start'):
+ if m.get('chat', {}).get('type') != 'private' or m.get('from', {}).get('is_bot'):
+  return
+ uid=m['from']['id'];t=m.get('text','').strip()
+ if not t:
+  return send(uid, 'Пожалуйста, отправь ответ текстом. Опрос остался на прежнем вопросе.')
+ if t.startswith('/'):
+  command, *rest = t.split(maxsplit=1)
+  t = command.split('@', 1)[0].lower() + ((' ' + rest[0]) if rest else '')
+ ensure(m['from']);s=gj(skey(uid))
+ if features.handle_text(sys.modules[__name__], uid, t):
+  return
+ if t.split(maxsplit=1)[0] == '/start':
   p=t.split(maxsplit=1);sp=None
-  if len(p)>1 and p[1].startswith('invite_'):sp=rc('GET','invite:'+p[1][7:]);rc('DEL','invite:'+p[1][7:]) if sp else None
-  ensure(m['from'],sp);return send(uid,'Привет. Я помогу работать с 10-м и 11-м Шагами.',menu(uid))
+  if len(p)>1 and p[1].startswith('invite_'):sp=rc('GETDEL','invite:'+p[1][7:])
+  ensure(m['from'],sp)
+  send(uid, 'Привет. Я помогу работать с 10-м и 11-м Шагами. Завершённые ответы сохраняются в базе и передаются владельцу бота и подключённому спонсору. Не указывай лишние персональные данные.', menu(uid))
+  if s and s.get('mode') in features.FLOW_MODES:
+   send(uid, 'Твой незаконченный опрос сохранён.', ik([[{'text': 'Продолжить', 'callback_data': 'resume'}]]))
+  return
  if t in ('🌅 Утренний 11 шаг','/morning'):return start_flow(uid,'morning',MORNING,'🌅 Утренний 11-й Шаг')
  if t in ('🌙 Вечерний 11 шаг','🌙 Вечерняя часть','/evening'):return start_flow(uid,'evening',EVENING,'🌙 Вечерний 11-й Шаг')
  if t in ('✍️ Текущий 10 шаг','/tenth'):return start_flow(uid,'tenth',TENTH,'✍️ Текущий 10-й Шаг')
@@ -155,39 +212,61 @@ def handle_text(m):
  if t in ('📣 Напомнить','/remind_missing') and uid==OWNER:return remind(uid)
  if t in ('🔗 Пригласить подопечного','/invite') and uid==OWNER:
   tok=secrets.token_urlsafe(8);rc('SET','invite:'+tok,uid,'EX',604800);name=tg('getMe',{})['result']['username'];return send(uid,f'<code>https://t.me/{name}?start=invite_{tok}</code>')
+ if features.consume_setting(sys.modules[__name__], uid, t):
+  return
+ if t.startswith('/'):
+  return send(uid, 'Неизвестная команда. /cancel — отменить диалог; /resume — продолжить опрос.')
+ if s and s.get('mode') in ('morning','evening','tenth') and not t.startswith('/'):
+  s['answers'].append(t);s['i']+=1;qs=qset(s['mode'])
+  if s['i']>=len(qs):return finish(uid,s)
+  sj(skey(uid),s,86400);return ask(uid,qs,s['i'])
+ if s and s.get('mode')=='sobriety_date':
+  return set_sobriety_date(uid, t)
+ if s and s.get('mode')=='task_add':
+  arr=gj(f'tasks:{uid}',[]) or [];arr.append({'text':t,'done':False});sj(f'tasks:{uid}',arr);rc('DEL',skey(uid));return tasks(uid)
  return send(uid,'Выбери действие.',menu(uid))
 
 def callback(c):
- uid=c['from']['id'];d=c.get('data','');tg('answerCallbackQuery',{'callback_query_id':c['id']})
- if d=='cancel':rc('DEL',skey(uid));return send(uid,'Отменено.',menu(uid))
+ if c.get('message', {}).get('chat', {}).get('type') != 'private' or c.get('from', {}).get('is_bot'):
+  return
+ uid=c['from']['id'];d=c.get('data','')
+ try:
+  tg('answerCallbackQuery',{'callback_query_id':c['id']})
+ except urllib.error.HTTPError as error:
+  if error.code != 400:
+   raise
+ if features.handle_callback(sys.modules[__name__], uid, d):
+  return
+ if d.startswith('card:'):
+  try:
+   subject = int(d[5:])
+  except ValueError:
+   return send(uid, 'Карточка не найдена.')
+  return sponsee_card(uid, subject)
+ if d=='cancel':rc('DEL',skey(uid),skey(uid)+':settings');return send(uid,'Отменено.',menu(uid))
  if d.startswith('flow:'):
-  mode=d.split(':')[1];return start_flow(uid,mode,qset(mode),{'morning':'🌅 Утренний 11-й Шаг','evening':'🌙 Вечерний 11-й Шаг','tenth':'✍️ Текущий 10-й Шаг'}[mode])
- if d=='task:add':sj(skey(uid),{'mode':'task_add'},3600);return send(uid,'Напиши новое задание.')
- if d=='task:done':
-  arr=gj(f'tasks:{uid}',[]) or []
-  for x in arr:
-   if not x.get('done'):x['done']=True;break
-  sj(f'tasks:{uid}',arr);return tasks(uid)
+  mode=d.split(':')[1]
+  if mode not in features.FLOW_MODES:
+   return send(uid, 'Эта кнопка устарела. Открой /start.')
+  return start_flow(uid,mode,qset(mode),{'morning':'🌅 Утренний 11-й Шаг','evening':'🌙 Вечерний 11-й Шаг','tenth':'✍️ Текущий 10-й Шаг'}[mode])
+ if d=='task:add':sj(skey(uid)+':settings',{'mode':'task_add'},3600);return send(uid,'Напиши новое задание.')
  if uid==OWNER:
   if d=='a:users':return admin_users(uid)
   if d=='a:today':return admin_today(uid)
   if d=='a:last':return admin_last(uid)
   if d=='a:remind':return remind(uid)
 
-def setup(host):return tg('setWebhook',{'url':'https://'+host+'/api/index'})
+ return send(uid, 'Эта кнопка устарела или недоступна. Открой /start.')
 
-class handler(BaseHTTPRequestHandler):
- def out(self,c=200,o=None):self.send_response(c);self.send_header('Content-Type','application/json');self.end_headers();self.wfile.write(json.dumps(o or {'ok':True}).encode())
- def do_GET(self):
-  q=urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-  try:
-   if 'setup' in q:return self.out(200,setup(self.headers.get('x-forwarded-host') or self.headers.get('host')))
-   return self.out(200,{'ok':True,'service':'EveryEveningBot Stage 3'})
-  except Exception as e:return self.out(500,{'ok':False,'error':str(e)})
- def do_POST(self):
-  try:
-   n=int(self.headers.get('content-length','0'));u=json.loads(self.rfile.read(n) or '{}')
-   if 'message' in u:handle_text(u['message'])
-   elif 'callback_query' in u:callback(u['callback_query'])
-   return self.out()
-  except Exception as e:return self.out(500,{'ok':False,'error':str(e)})
+class handler(WebhookHandler):
+ """Vercel entrypoint remains api.stage3:handler; no wrapper imports."""
+ def dispatch(self, update):
+  if 'message' in update:
+   handle_text(update['message'])
+  elif 'callback_query' in update:
+   callback(update['callback_query'])
+
+ def configure(self, url, secret):
+  return tg('setWebhook', {'url': url, 'secret_token': secret, 'max_connections': 1,
+                           'allowed_updates': ['message', 'callback_query'],
+                           'drop_pending_updates': False})
